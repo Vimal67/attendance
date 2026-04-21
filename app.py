@@ -1,318 +1,338 @@
-import io
-import os
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+import cv2 as cv
+import numpy as np
+import onnxruntime as ort
 import pickle
 from pathlib import Path
 
-import cv2 as cv
-import numpy as np
-import streamlit as st
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = BASE_DIR / "model"
 
-try:
-    import onnxruntime as ort
-except Exception as exc:  # pragma: no cover
-    ort = None
-    ORT_IMPORT_ERROR = exc
-else:
-    ORT_IMPORT_ERROR = None
-
-
-# =========================
-# Config
-# =========================
-PROJECT_ROOT = Path(__file__).resolve().parent
-MODEL_DIR = PROJECT_ROOT / "model"
+YUNET_MODEL_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
+ARCFACE_MODEL_PATH = MODEL_DIR / "arcface_w600k_r50.onnx"
 SVM_MODEL_PATH = MODEL_DIR / "svm_model_160x160.pkl"
 LABEL_ENCODER_PATH = MODEL_DIR / "label_encoder.pkl"
-ARCFACE_MODEL_PATH = MODEL_DIR / "arcface_w600k_r50.onnx"
-YUNET_MODEL_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
-ARCFACE_INPUT_SIZE = (112, 112)
-DEFAULT_CONF_THRESHOLD = 0.35
-DEFAULT_MARGIN_THRESHOLD = 0.08
-DEFAULT_DETECTION_THRESHOLD = 0.70
-MIN_DET_FACE_SIZE = 60
-MAX_FACES = 5
 
+EMBEDDING_SIZE = (112, 112)
+DETECTION_SCORE_THRESHOLD = 0.70
+SVM_CONF_THRESHOLD = 0.50
 
-# =========================
-# UI setup
-# =========================
-st.set_page_config(
-    page_title="Face Recognition Mobile App",
-    page_icon="📷",
-    layout="centered",
+app = FastAPI(title="Live Face Recognition API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-st.title("📷 Face Recognition")
-st.caption("Camera or upload image → detect face → ArcFace embedding → SVM identity prediction")
+detector = None
+ort_session = None
+arcface_input_name = None
+arcface_output_name = None
+svm_model = None
+label_encoder = None
 
 
-# =========================
-# Helpers
-# =========================
-def file_must_exist(path: Path, label: str) -> Path:
-    if not path.exists():
-        raise FileNotFoundError(f"{label} not found: {path}")
-    return path
+def _assert_model_files():
+    required = [
+        YUNET_MODEL_PATH,
+        ARCFACE_MODEL_PATH,
+        SVM_MODEL_PATH,
+        LABEL_ENCODER_PATH,
+    ]
+    missing = [str(p.name) for p in required if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing required model files in ./model: " + ", ".join(missing)
+        )
 
 
-@st.cache_resource(show_spinner=False)
-def load_runtime():
-    if ort is None:
-        raise RuntimeError(
-            "onnxruntime is not installed. Run: pip install onnxruntime"
-        ) from ORT_IMPORT_ERROR
+def l2_normalize(x: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(x, axis=1, keepdims=True)
+    return x / np.clip(norm, 1e-12, None)
 
-    svm_path = file_must_exist(SVM_MODEL_PATH, "SVM model")
-    encoder_path = file_must_exist(LABEL_ENCODER_PATH, "Label encoder")
-    arcface_path = file_must_exist(ARCFACE_MODEL_PATH, "ArcFace model")
-    yunet_path = file_must_exist(YUNET_MODEL_PATH, "YuNet detector model")
 
-    with open(svm_path, "rb") as f:
-        svm_model = pickle.load(f)
-    with open(encoder_path, "rb") as f:
-        label_encoder = pickle.load(f)
+def load_models():
+    global detector, ort_session, arcface_input_name, arcface_output_name, svm_model, label_encoder
 
-    # Keep ONNX runtime CPU-only for portability.
-    session = ort.InferenceSession(str(arcface_path), providers=["CPUExecutionProvider"])
-    input_name = session.get_inputs()[0].name
-    output_name = session.get_outputs()[0].name
+    if detector is not None:
+        return
+
+    _assert_model_files()
 
     detector = cv.FaceDetectorYN_create(
-        str(yunet_path),
+        str(YUNET_MODEL_PATH),
         "",
         (320, 320),
-        DEFAULT_DETECTION_THRESHOLD,
+        DETECTION_SCORE_THRESHOLD,
         0.5,
         5000,
     )
 
-    return {
-        "svm_model": svm_model,
-        "label_encoder": label_encoder,
-        "arc_session": session,
-        "arc_input_name": input_name,
-        "arc_output_name": output_name,
-        "detector": detector,
-    }
+    ort_session = ort.InferenceSession(
+        str(ARCFACE_MODEL_PATH),
+        providers=["CPUExecutionProvider"],
+    )
+    arcface_input_name = ort_session.get_inputs()[0].name
+    arcface_output_name = ort_session.get_outputs()[0].name
+
+    with open(SVM_MODEL_PATH, "rb") as f:
+        svm_model = pickle.load(f)
+
+    with open(LABEL_ENCODER_PATH, "rb") as f:
+        label_encoder = pickle.load(f)
 
 
-def uploaded_file_to_bgr(uploaded_file) -> np.ndarray:
-    bytes_data = uploaded_file.getvalue()
-    image = cv.imdecode(np.frombuffer(bytes_data, np.uint8), cv.IMREAD_COLOR)
-    if image is None:
-        raise ValueError("Could not decode image")
-    return image
-
-
-def detect_faces_bgr(bgr_image: np.ndarray, detector, score_threshold: float):
-    image = bgr_image.copy()
-    h, w = image.shape[:2]
-    detector.setInputSize((w, h))
-    detector.setScoreThreshold(float(score_threshold))
-    _, faces = detector.detect(image)
-
-    detections = []
-    if faces is None:
-        return detections
-
-    for row in faces:
-        x, y, fw, fh = row[:4]
-        score = float(row[14]) if len(row) > 14 else 0.0
-        if score < score_threshold:
-            continue
-
-        x1 = int(max(0, x))
-        y1 = int(max(0, y))
-        x2 = int(min(w, x + fw))
-        y2 = int(min(h, y + fh))
-        if x2 <= x1 or y2 <= y1:
-            continue
-        if min(x2 - x1, y2 - y1) < MIN_DET_FACE_SIZE:
-            continue
-
-        detections.append({
-            "box": (x1, y1, x2, y2),
-            "score": score,
-            "area": (x2 - x1) * (y2 - y1),
-        })
-
-    detections.sort(key=lambda d: (d["score"], d["area"]), reverse=True)
-    return detections[:MAX_FACES]
-
-
-
-def face_crop_for_embedding(rgb_image: np.ndarray, box):
-    x1, y1, x2, y2 = box
-    crop = rgb_image[y1:y2, x1:x2]
-    if crop.size == 0:
-        raise ValueError("Empty face crop")
-    crop = cv.resize(crop, ARCFACE_INPUT_SIZE, interpolation=cv.INTER_AREA)
-    return crop
-
-
-
-def get_embedding(face_rgb: np.ndarray, runtime) -> np.ndarray:
-    face = face_rgb.astype(np.float32)
+def get_embedding(face_rgb: np.ndarray) -> np.ndarray:
+    face = cv.resize(face_rgb, EMBEDDING_SIZE, interpolation=cv.INTER_AREA)
+    face = face.astype(np.float32)
     face = (face - 127.5) / 127.5
-    face = np.transpose(face, (2, 0, 1))[None, ...]
-    embedding = runtime["arc_session"].run(
-        [runtime["arc_output_name"]],
-        {runtime["arc_input_name"]: face},
-    )[0]
-    embedding = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
-    norms = np.linalg.norm(embedding, axis=1, keepdims=True)
-    embedding = embedding / np.clip(norms, 1e-12, None)
-    return embedding
+    face = np.transpose(face, (2, 0, 1))
+    face = np.expand_dims(face, axis=0).astype(np.float32)
+
+    output = ort_session.run([arcface_output_name], {arcface_input_name: face})[0]
+    output = np.asarray(output, dtype=np.float32)
+    return l2_normalize(output)
 
 
-
-def predict_identity(embedding: np.ndarray, runtime, conf_threshold: float, margin_threshold: float):
-    svm_model = runtime["svm_model"]
-    label_encoder = runtime["label_encoder"]
-
-    if not hasattr(svm_model, "predict_proba"):
-        pred_idx = int(svm_model.predict(embedding)[0])
-        name = str(label_encoder.inverse_transform([pred_idx])[0])
-        return {
-            "name": name,
-            "confidence": None,
-            "margin": None,
-            "second_best": None,
-            "accepted": True,
-        }
-
+def predict_identity(embedding: np.ndarray):
     probs = svm_model.predict_proba(embedding)[0]
     best_idx = int(np.argmax(probs))
     best_prob = float(probs[best_idx])
 
-    if probs.shape[0] > 1:
-        sorted_probs = np.sort(probs)
-        second_prob = float(sorted_probs[-2])
-    else:
-        second_prob = 0.0
+    if best_prob < SVM_CONF_THRESHOLD:
+        return "Unknown", best_prob
 
-    margin = best_prob - second_prob
-    accepted = (best_prob >= conf_threshold) and (margin >= margin_threshold)
+    label = svm_model.classes_[best_idx]
+    try:
+        name = label_encoder.inverse_transform([label])[0]
+    except Exception:
+        name = str(label)
 
-    if accepted:
-        encoded_class = int(svm_model.classes_[best_idx]) if hasattr(svm_model, "classes_") else best_idx
-        name = str(label_encoder.inverse_transform([encoded_class])[0])
-    else:
-        name = "Unknown"
+    return str(name), best_prob
 
-    second_best = second_prob if probs.shape[0] > 1 else None
-    return {
-        "name": name,
-        "confidence": best_prob,
-        "margin": margin,
-        "second_best": second_best,
-        "accepted": accepted,
+
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Face Recognition</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#111; color:#fff; margin:0; padding:20px; text-align:center; }
+    .wrap { max-width:700px; margin:auto; }
+    .video-box { position:relative; display:inline-block; width:100%; max-width:640px; }
+    video, canvas.overlay { width:100%; border-radius:12px; border:2px solid #333; margin-top:12px; }
+    canvas.overlay { position:absolute; left:0; top:0; pointer-events:none; }
+    #status { margin-top:16px; font-size:18px; min-height:28px; }
+    button { margin:8px; padding:12px 18px; border:none; border-radius:10px; font-size:16px; cursor:pointer; }
+    .note { color:#bbb; font-size:14px; margin-top:10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Live Face Recognition</h2>
+    <div class="video-box">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay" class="overlay"></canvas>
+    </div>
+    <canvas id="capture" style="display:none;"></canvas>
+    <div id="status">Starting camera...</div>
+    <div>
+      <button id="startBtn">Start Detection</button>
+      <button id="stopBtn">Stop Detection</button>
+    </div>
+    <div class="note">This is sampled live detection. One frame is sent every ~700 ms.</div>
+  </div>
+
+  <script>
+    const video = document.getElementById("video");
+    const overlay = document.getElementById("overlay");
+    const capture = document.getElementById("capture");
+    const statusDiv = document.getElementById("status");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+
+    let stream = null;
+    let intervalId = null;
+    let isSending = false;
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: false
+        });
+        video.srcObject = stream;
+        statusDiv.innerText = "Camera ready";
+      } catch (err) {
+        statusDiv.innerText = "Camera access denied or not available";
+        console.error(err);
+      }
     }
 
+    function drawDetections(detections) {
+      if (!video.videoWidth || !video.videoHeight) return;
+
+      overlay.width = video.clientWidth;
+      overlay.height = video.clientHeight;
+
+      const scaleX = overlay.width / video.videoWidth;
+      const scaleY = overlay.height / video.videoHeight;
+
+      const ctx = overlay.getContext("2d");
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      ctx.lineWidth = 2;
+      ctx.font = "16px Arial";
+
+      detections.forEach(det => {
+        const x = det.box.x1 * scaleX;
+        const y = det.box.y1 * scaleY;
+        const w = (det.box.x2 - det.box.x1) * scaleX;
+        const h = (det.box.y2 - det.box.y1) * scaleY;
+
+        ctx.strokeStyle = det.name === "Unknown" ? "#ff3b30" : "#00ff66";
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.strokeRect(x, y, w, h);
+
+        const label = `${det.name} (${det.confidence})`;
+        const textWidth = ctx.measureText(label).width + 10;
+        ctx.fillRect(x, Math.max(0, y - 24), textWidth, 22);
+        ctx.fillStyle = "#000";
+        ctx.fillText(label, x + 5, Math.max(16, y - 8));
+      });
+    }
+
+    async function sendFrame() {
+      if (isSending || !video.videoWidth || !video.videoHeight) return;
+      isSending = true;
+
+      capture.width = video.videoWidth;
+      capture.height = video.videoHeight;
+
+      const ctx = capture.getContext("2d");
+      ctx.drawImage(video, 0, 0, capture.width, capture.height);
+
+      capture.toBlob(async (blob) => {
+        try {
+          const formData = new FormData();
+          formData.append("file", blob, "frame.jpg");
+
+          const response = await fetch("/recognize", {
+            method: "POST",
+            body: formData
+          });
+
+          const data = await response.json();
+
+          if (data.detections && data.detections.length > 0) {
+            const top = data.detections[0];
+            statusDiv.innerText = `Name: ${top.name} | Confidence: ${top.confidence}`;
+            drawDetections(data.detections);
+          } else {
+            statusDiv.innerText = "No face detected";
+            drawDetections([]);
+          }
+        } catch (err) {
+          console.error(err);
+          statusDiv.innerText = "Backend error";
+        } finally {
+          isSending = false;
+        }
+      }, "image/jpeg", 0.8);
+    }
+
+    startBtn.addEventListener("click", () => {
+      if (!intervalId) {
+        intervalId = setInterval(sendFrame, 700);
+        statusDiv.innerText = "Live detection started";
+      }
+    });
+
+    stopBtn.addEventListener("click", () => {
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+        statusDiv.innerText = "Detection stopped";
+      }
+      drawDetections([]);
+    });
+
+    video.addEventListener("loadedmetadata", () => {
+      overlay.width = video.clientWidth;
+      overlay.height = video.clientHeight;
+    });
+
+    startCamera();
+  </script>
+</body>
+</html>
+"""
 
 
-def draw_result(image_bgr: np.ndarray, detections, results):
-    annotated = image_bgr.copy()
-    for det, res in zip(detections, results):
-        x1, y1, x2, y2 = det["box"]
-        color = (0, 255, 0) if res["accepted"] else (0, 0, 255)
-        cv.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        conf_txt = "N/A" if res["confidence"] is None else f"{res['confidence']:.2f}"
-        label = f"{res['name']} | {conf_txt}"
-        cv.putText(
-            annotated,
-            label,
-            (x1, max(24, y1 - 8)),
-            cv.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
-            2,
-            cv.LINE_AA,
-        )
-    return annotated
+@app.on_event("startup")
+def startup_event():
+    load_models()
 
 
-# =========================
-# Sidebar
-# =========================
-with st.sidebar:
-    st.subheader("Settings")
-    conf_threshold = st.slider("SVM confidence threshold", 0.0, 1.0, DEFAULT_CONF_THRESHOLD, 0.01)
-    margin_threshold = st.slider("Top-1 vs Top-2 margin", 0.0, 1.0, DEFAULT_MARGIN_THRESHOLD, 0.01)
-    det_threshold = st.slider("Face detection threshold", 0.1, 1.0, DEFAULT_DETECTION_THRESHOLD, 0.01)
-    source_mode = st.radio("Input source", ["Camera", "Upload"], horizontal=True)
-
-    st.markdown("---")
-    st.caption("Expected files")
-    st.code(
-        "model/arcface_w600k_r50.onnx\n"
-        "model/face_detection_yunet_2023mar.onnx\n"
-        "model/svm_model_160x160.pkl\n"
-        "model/label_encoder.pkl",
-        language="text",
-    )
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return INDEX_HTML
 
 
-# =========================
-# Input
-# =========================
-uploaded = None
-if source_mode == "Camera":
-    uploaded = st.camera_input("Take a picture")
-else:
-    uploaded = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png", "webp"])
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
-# =========================
-# Main processing
-# =========================
-try:
-    runtime = load_runtime()
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
+@app.post("/recognize")
+async def recognize(file: UploadFile = File(...)):
+    data = await file.read()
+    arr = np.frombuffer(data, np.uint8)
+    bgr = cv.imdecode(arr, cv.IMREAD_COLOR)
 
-if uploaded is None:
-    st.info("Capture or upload an image to start recognition.")
-    st.stop()
+    if bgr is None:
+        return JSONResponse(status_code=400, content={"error": "Invalid image"})
 
-try:
-    image_bgr = uploaded_file_to_bgr(uploaded)
-except Exception as exc:
-    st.error(f"Image read failed: {exc}")
-    st.stop()
+    h, w = bgr.shape[:2]
+    detector.setInputSize((w, h))
+    _, faces = detector.detect(bgr)
 
-runtime["detector"].setScoreThreshold(float(det_threshold))
-detections = detect_faces_bgr(image_bgr, runtime["detector"], det_threshold)
+    if faces is None or len(faces) == 0:
+        return {"detections": []}
 
-if not detections:
-    st.image(cv.cvtColor(image_bgr, cv.COLOR_BGR2RGB), caption="Input image", use_container_width=True)
-    st.warning("No face detected.")
-    st.stop()
+    rgb = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
+    detections = []
 
-rgb_image = cv.cvtColor(image_bgr, cv.COLOR_BGR2RGB)
-results = []
-for det in detections:
-    face_rgb = face_crop_for_embedding(rgb_image, det["box"])
-    embedding = get_embedding(face_rgb, runtime)
-    result = predict_identity(embedding, runtime, conf_threshold, margin_threshold)
-    results.append(result)
+    for row in faces:
+        x, y, fw, fh = row[:4]
+        score = float(row[14]) if len(row) > 14 else 0.0
 
-annotated = draw_result(image_bgr, detections, results)
+        x1 = max(0, int(x))
+        y1 = max(0, int(y))
+        x2 = min(w, int(x + fw))
+        y2 = min(h, int(y + fh))
 
-st.image(cv.cvtColor(annotated, cv.COLOR_BGR2RGB), caption="Recognition result", use_container_width=True)
+        if x2 <= x1 or y2 <= y1:
+            continue
 
-st.subheader("Predictions")
-for idx, (det, res) in enumerate(zip(detections, results), start=1):
-    x1, y1, x2, y2 = det["box"]
-    with st.container(border=True):
-        st.markdown(f"**Face {idx}**")
-        st.write({
-            "name": res["name"],
-            "accepted": res["accepted"],
-            "confidence": None if res["confidence"] is None else round(res["confidence"], 4),
-            "margin": None if res["margin"] is None else round(res["margin"], 4),
-            "second_best": None if res["second_best"] is None else round(res["second_best"], 4),
+        face_rgb = rgb[y1:y2, x1:x2]
+        if face_rgb.size == 0:
+            continue
+
+        emb = get_embedding(face_rgb)
+        name, conf = predict_identity(emb)
+
+        detections.append({
+            "name": name,
+            "confidence": round(conf, 4),
+            "detector_score": round(score, 4),
             "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-            "det_score": round(det["score"], 4),
         })
+
+    return {"detections": detections}
