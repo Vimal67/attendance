@@ -1,6 +1,19 @@
-streamlit
-opencv-python-headless
-numpy
+# streamlit
+# opencv-python-headless
+# numpy
+# onnxruntime
+# scikit-learn
+# Pillow
+
+
+
+
+fastapi
+uvicorn
+python-multipart
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
 onnxruntime
-scikit-learn
-Pillow
+scikit-learn==1.6.1
+scipy==1.13.1
+joblib
